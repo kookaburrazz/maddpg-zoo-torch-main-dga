@@ -1,246 +1,166 @@
-"""
-Training script for MADDPG with PettingZoo
-"""
 import torch
 import numpy as np
-import os
 import argparse
-from tqdm import tqdm
+import os
+import time
 from datetime import datetime
+from collections import deque
 
-
-from maddpg import MADDPG, MADDPGApprox, ReplayBuffer
-from utils.env import get_env_info, ENV_MAP, create_single_env
-from utils.logger import Logger
-from utils.utils import evaluate
-
+from maddpg.maddpg import MADDPG
+from utils.env import create_single_env, ENV_MAP, get_env_info
 
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--env-name", type=str, default="simple_spread_v3", 
-                       choices=list(ENV_MAP.keys()),
-                       help="Name of the environment to use")
-    parser.add_argument("--algo", type=str, default="MADDPG", choices=["MADDPG", "MADDPGApprox"],
-                       help="Algorithm to use")
-    parser.add_argument("--total-timesteps", type=int, default=int(1e6), help="Total timesteps")
-    parser.add_argument("--buffer-size", type=int, default=int(1e6), help="Replay buffer size")
-    parser.add_argument("--warmup-steps", type=int, default=20000, help="Warmup steps")
-    parser.add_argument("--batch-size", type=int, default=512, help="Batch size")
-    parser.add_argument("--max-steps", type=int, default=25, help="Maximum steps per episode")
-    parser.add_argument("--gamma", type=float, default=0.95, help="Discount factor")
-    parser.add_argument("--tau", type=float, default=0.01, help="Soft update parameter")
-    parser.add_argument("--actor-lr", type=float, default=1e-3, help="Actor learning rate")
-    parser.add_argument("--critic-lr", type=float, default=2e-3, help="Critic learning rate")
-    parser.add_argument("--hidden-sizes", type=str, default="64,64", help="Hidden layer sizes (comma-separated)")
-    parser.add_argument("--update-every", type=int, default=15, help="Update networks every n steps")
-    parser.add_argument("--noise-scale", type=float, default=0.3, help="Initial noise scale")
-    parser.add_argument("--min-noise", type=float, default=0.05, help="Minimum noise scale")
-    parser.add_argument("--noise-decay-steps", type=int, 
-                        default=int(3e5), 
-                        help="Number of step to decay noise to min_noise default: 300k")
-    parser.add_argument("--use-noise-decay", action="store_true", help="Use noise decay")
-    parser.add_argument("--render-mode", type=str, default=None, choices=[None, "human", "rgb_array"], 
-                       help="Render mode for visualization")
-    parser.add_argument("--create-gif", action="store_true", help="Create GIF of episodes")
-    parser.add_argument("--eval-interval", type=int, default=5000, help="Evaluate every n steps")
-   
+    parser = argparse.ArgumentParser("MADDPG Training with DAG Attention")
+    
+    # Environment
+    parser.add_argument("--env-name", type=str, default="simple_spread_v3", choices=list(ENV_MAP.keys()))
+    parser.add_argument("--max-steps", type=int, default=25, help="Max steps per episode")
+    
+    # Training
+    parser.add_argument("--episodes", type=int, default=10000, help="Total training episodes")
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--lr-actor", type=float, default=1e-4)
+    parser.add_argument("--lr-critic", type=float, default=1e-3)
+    parser.add_argument("--gamma", type=float, default=0.95)
+    
+    # DAG Attention Specific
+    parser.add_argument("--use-dag", action="store_true", default=False, 
+                       help="Enable DAG-Attention Critic")
+    
+    # Saving & Logging
+    parser.add_argument("--save-dir", type=str, default="./runs", help="Directory to save models")
+    parser.add_argument("--save-rate", type=int, default=1000, help="Save model every N episodes")
+    parser.add_argument("--print-rate", type=int, default=100, help="Print progress every N episodes")
+    
     return parser.parse_args()
 
+class ReplayBuffer:
+    def __init__(self, capacity, num_agents, state_sizes, action_sizes):
+        self.capacity = capacity
+        self.num_agents = num_agents
+        self.ptr = 0
+        self.size = 0
+        
+        # Initialize buffers
+        self.states = [np.zeros((capacity, s)) for s in state_sizes]
+        self.actions = [np.zeros((capacity, a)) for a in action_sizes]
+        self.rewards = [np.zeros((capacity, 1)) for _ in range(num_agents)]
+        self.next_states = [np.zeros((capacity, s)) for s in state_sizes]
+        self.dones = [np.zeros((capacity, 1)) for _ in range(num_agents)]
+        
+    def add(self, states, actions, rewards, next_states, dones):
+        for i in range(self.num_agents):
+            self.states[i][self.ptr] = states[i]
+            self.actions[i][self.ptr] = actions[i]
+            self.rewards[i][self.ptr] = rewards[i]
+            self.next_states[i][self.ptr] = next_states[i]
+            self.dones[i][self.ptr] = dones[i]
+            
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+        
+    def sample(self, batch_size):
+        idx = np.random.choice(self.size, batch_size)
+        
+        states = [torch.tensor(self.states[i][idx], dtype=torch.float32).cuda() for i in range(self.num_agents)]
+        actions = [torch.tensor(self.actions[i][idx], dtype=torch.float32).cuda() for i in range(self.num_agents)]
+        rewards = [torch.tensor(self.rewards[i][idx], dtype=torch.float32).cuda() for i in range(self.num_agents)]
+        next_states = [torch.tensor(self.next_states[i][idx], dtype=torch.float32).cuda() for i in range(self.num_agents)]
+        dones = [torch.tensor(self.dones[i][idx], dtype=torch.float32).cuda() for i in range(self.num_agents)]
+        
+        # Concat for centralized critic
+        states_full = torch.cat(states, dim=1)
+        next_states_full = torch.cat(next_states, dim=1)
+        actions_full = torch.cat(actions, dim=1)
+        
+        return states, actions, rewards, next_states, dones, states_full, next_states_full, actions_full
+
 def train(args):
-    
-    # Add timestamp to experiment name for uniqueness
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    experiment_name = (
-        "single"
-        f"_b{args.batch_size}"
-        f"_usteps{args.update_every}"
-        f"_g{args.gamma}"
-        f"_t{args.tau}"
-        f"_alr{args.actor_lr}"
-        f"_clr{args.critic_lr}"
-        f"_n{args.noise_scale}"
-        f"_minn{args.min_noise}"
-        f"_h{args.hidden_sizes}"
-        f"_{timestamp}")
-
-    logger = Logger(
-        run_name=experiment_name,
-        folder="runs",
-        algo=args.algo,
-        env=args.env_name
-    )
-    logger.log_all_hyperparameters(vars(args))
-    
-
-    # Get environment information
+    # 1. Setup Environment
     agents, num_agents, action_sizes, action_low, action_high, state_sizes = get_env_info(
-        env_name=args.env_name, 
-        max_steps=args.max_steps,
-        apply_padding=False  
+        env_name=args.env_name, max_steps=args.max_steps
     )
+    env = create_single_env(args.env_name, max_steps=args.max_steps)
 
-    # Create environment with appropriate render mode
-    env = create_single_env(
-        env_name=args.env_name,
-        max_steps=args.max_steps,
-        render_mode=args.render_mode,
-        apply_padding=False
-    )
-    
-    # Create evaluation environment
-    env_evaluate = create_single_env(
-        env_name=args.env_name,
-        max_steps=args.max_steps,
-        render_mode="rgb_array",
-        apply_padding=False
-    )
-    
-    # Model path
-    model_path = os.path.join(logger.dir_name, "model.pt")
-    best_model_path = os.path.join(logger.dir_name, "best_model.pt")
-    best_score = -float('inf')
-    
-    # Parse hidden sizes
-    hidden_sizes = tuple(map(int, args.hidden_sizes.split(',')))
-    
-    # Create MADDPG agent
-    if args.algo == "MADDPG":
-        maddpg = MADDPG(
-            state_sizes=state_sizes,
-            action_sizes=action_sizes,
-            hidden_sizes=hidden_sizes,
-            actor_lr=args.actor_lr,
-            critic_lr=args.critic_lr,
-            gamma=args.gamma,
-            tau=args.tau,
-            action_low=action_low,
-            action_high=action_high
-        )
-    else:
-        maddpg = MADDPGApprox(
-            state_sizes=state_sizes,
-            action_sizes=action_sizes,
-            hidden_sizes=hidden_sizes,
-            actor_lr=args.actor_lr,
-            critic_lr=args.critic_lr,
-            gamma=args.gamma,
-            tau=args.tau,
-            action_low=action_low,
-            action_high=action_high
-        )
-    
-    # Create replay buffer with the correct dimensions
-    buffer = ReplayBuffer(
-        buffer_size=args.buffer_size,
-        batch_size=args.batch_size,
-        agents=agents,
+    # 2. Define Groups (Simple Logic)
+    # 修正逻辑：我们需要一个长度为 num_agents 的列表，每个位置代表该 agent 的组 ID
+    # 例如 simple_spread (3 agents) -> [0, 0, 0] (大家都是组0，完全合作)
+    # 例如 simple_tag (3 pred, 1 prey) -> [0, 0, 0, 1] (前三个是组0，最后一个是组1)
+
+    agent_groups = [0] * num_agents  # 默认所有人都是组 0
+
+    if "tag" in args.env_name:
+        # 如果是捕食者游戏，最后一个智能体是猎物，设为组 1
+        # 前面的保持为 0
+        agent_groups[num_agents - 1] = 1
+
+    print(f"Agent Groups: {agent_groups}")  # 打印出来确认一下，应该是 [0, 0, 0] 这种
+
+    # 3. Initialize MADDPG
+    maddpg = MADDPG(
         state_sizes=state_sizes,
-        action_sizes=action_sizes
+        action_sizes=action_sizes,
+        agent_groups=agent_groups,
+        use_dag_attention=args.use_dag, # <--- 开关
+        hidden_sizes=(64, 64),
+        actor_lr=args.lr_actor,
+        critic_lr=args.lr_critic,
+        gamma=args.gamma
     )
     
-    # Training loop
-    noise_scale = args.noise_scale
-    noise_decay = (args.noise_scale - args.min_noise) / min(args.noise_decay_steps, args.total_timesteps)
-    print(f"Using linear noise decay: {args.noise_scale} to {args.min_noise} over {args.noise_decay_steps} steps")
-    print(f"Noise will decrease by {noise_decay:.6f} per step")
-
-    evaluate(env_evaluate, maddpg, logger, record_gif=args.create_gif, num_eval_episodes=10, global_step=0)
+    # 4. Setup Buffer & Logging
+    buffer = ReplayBuffer(100000, num_agents, state_sizes, action_sizes)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    mode_str = "DAG" if args.use_dag else "MLP"
+    run_dir = os.path.join(args.save_dir, args.env_name, f"{mode_str}_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
     
-    # For tracking agent-specific rewards
-    agent_rewards = [[] for _ in range(len(agents))]
-    episode_rewards = np.zeros(len(agents))
+    scores_deque = deque(maxlen=100)
+    start_time = time.time()
+    
+    print(f"Start Training: {args.env_name} | Mode: {mode_str} | Agents: {num_agents}")
 
-    # Reset environment and agents
-    observations, _ = env.reset()
-
-    for global_step in tqdm(range(1, args.total_timesteps + 1), desc="Training"):
+    # 5. Training Loop
+    for i_episode in range(1, args.episodes + 1):
+        obs, _ = env.reset()
+        episode_rewards = np.zeros(num_agents)
         
-        # Get states for all agents
-        states_list = [np.array(observations[agent], dtype=np.float32) for agent in agents]
+        # Noise decay
+        noise = max(0.05, 1.0 - i_episode / 2000.0) # Decay over 2000 episodes
         
-        # Get actions for all agents
-        actions_list = maddpg.act(states_list, add_noise=True, noise_scale=noise_scale)
-        
-        # Convert actions to dictionary for environment
-        actions = {agent: action for agent, action in zip(agents, actions_list)}
-        
-        # Take a step in the environment
-        next_observations, rewards, terminations, truncations, _ = env.step(actions)
-        
-        # Check if episode is done
-        dones = [terminations[agent] or truncations[agent] for agent in agents]
-        done = any(dones)
-        
-        # Prepare data for buffer (convert to NumPy once)
-        rewards_array = np.array([rewards[agent] for agent in agents], dtype=np.float32)
-        next_states_list = [np.array(next_observations[agent], dtype=np.float32) for agent in agents]
-        # we care about the termination of the episode
-        terminations_array = np.array([terminations[agent] for agent in agents], dtype=np.uint8)
-        
-        # Store experience in replay buffer
-        buffer.add(
-            states=states_list,
-            actions=actions_list,
-            rewards=rewards_array,
-            next_states=next_states_list,
-            dones=terminations_array
-        )
-        
-        # Update observations and rewards
-        observations = next_observations
-        episode_rewards += np.array(list(rewards.values()))         
-        
-        # Learn if enough samples are available in memory
-        if global_step > args.warmup_steps and global_step % args.update_every == 0:
-            for i in range(len(agents)):
-                experiences = buffer.sample()  # Now returns pre-combined states
-                critic_loss, actor_loss = maddpg.learn(experiences, i)
+        for step in range(args.max_steps):
+            # 1. Action
+            states = [np.array(obs[ag], dtype=np.float32) for ag in agents]
+            actions_list = maddpg.act(states, add_noise=True, noise_scale=noise)
+            actions_dict = {ag: act for ag, act in zip(agents, actions_list)}
+            
+            # 2. Step
+            next_obs, rewards, terms, truncs, _ = env.step(actions_dict)
+            next_states = [np.array(next_obs[ag], dtype=np.float32) for ag in agents]
+            dones_list = [terms[ag] or truncs[ag] for ag in agents]
+            rewards_list = [rewards[ag] for ag in agents]
+            
+            # 3. Store
+            buffer.add(states, actions_list, rewards_list, next_states, dones_list)
+            
+            # 4. Update
+            if buffer.size > args.batch_size:
+                for agent_idx in range(num_agents):
+                    sample = buffer.sample(args.batch_size)
+                    maddpg.learn(sample, agent_idx)
+                maddpg.update_targets()
+            
+            obs = next_obs
+            episode_rewards += rewards_list
+            
+            if any(dones_list):
+                break
                 
-                # Log losses to TensorBoard
-                logger.add_scalar(f'{agents[i]}/critic_loss', critic_loss, global_step)
-                logger.add_scalar(f'{agents[i]}/actor_loss', actor_loss, global_step)
-                
-            maddpg.update_targets()
+        scores_deque.append(np.sum(episode_rewards))
         
-        # Update noise scale based on iteration number
-        if global_step > args.warmup_steps and args.use_noise_decay:
-            noise_scale = max(
-                args.min_noise,
-                noise_scale - noise_decay
-            )
-        
-        # Handle episode end
-        if done or (global_step % args.max_steps == 0):  # Reset after max_steps if not done
-            for i, reward in enumerate(episode_rewards):
-                agent_rewards[i].append(reward)
-                logger.add_scalar(f"{agents[i]}/episode_reward", reward, global_step)
-            logger.add_scalar('train/total_reward', np.sum(episode_rewards), global_step)
-            logger.add_scalar(f"noise/scale", noise_scale, global_step)
-            observations, _ = env.reset()
-            episode_rewards = np.zeros(len(agents))
-        
-        # Evaluate and save
-        if global_step % args.eval_interval == 0 or global_step == args.total_timesteps:
-            maddpg.save(model_path)
-            avg_eval_rewards = evaluate(env_evaluate, maddpg, logger,
-                    num_eval_episodes=10, record_gif=args.create_gif, global_step=global_step)
-            np.save(os.path.join(logger.dir_name, "agent_rewards.npy"), agent_rewards)
-            score = np.sum(avg_eval_rewards)
-            if score > best_score:
-                best_score = score
-                maddpg.save(best_model_path)
-    
-    # Save final models
-    maddpg.save(model_path)
-    np.save(os.path.join(logger.dir_name, "agent_rewards.npy"), agent_rewards)
-    
-    # Close environment and TensorBoard writer
-    env.close()
-    env_evaluate.close()
-    logger.close()
-    
-    # Return both the agent rewards and the experiment name
-    return agent_rewards, experiment_name
+        # Logging
+        if i_episode % args.print_rate == 0:
+            avg_score = np.mean(scores_deque)
 
 if __name__ == "__main__":
     args = parse_args()

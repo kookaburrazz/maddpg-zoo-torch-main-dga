@@ -16,3 +16,5 @@ dependencies:
       - supersuit
       - tqdm
       - imageio
+
+  - torch
