@@ -98,7 +98,7 @@ def run(args):
             action_sizes=action_sizes,
             agent_groups=agent_groups,      # <--- 必须传入
             use_dag_attention=args.use_dag, # <--- 必须传入
-            hidden_sizes=(64, 64),
+            hidden_sizes=(256, 256),
             action_low=action_low,
             action_high=action_high
         )
