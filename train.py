@@ -34,6 +34,7 @@ def parse_args():
     parser.add_argument("--save-dir", type=str, default="./runs", help="Directory to save models")
     parser.add_argument("--save-rate", type=int, default=1000, help="Save model every N episodes")
     parser.add_argument("--print-rate", type=int, default=50, help="Print progress every N episodes")  # 默认改为50
+    parser.add_argument("--run-name", type=str, default=None, help="Name of the run for output directory")
     return parser.parse_args()
 
 
@@ -100,10 +101,27 @@ def train(args):
     )
 
     buffer = ReplayBuffer(100000, num_agents, state_sizes, action_sizes)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    #timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     mode_str = "DAG" if args.use_dag else "MLP"
-    run_dir = os.path.join(args.save_dir, args.env_name, f"{mode_str}_{timestamp}")
+    #run_dir = os.path.join(args.save_dir, args.env_name, f"{mode_str}_{timestamp}")
+    # 1. 先确定算法名字
+    algo_name = "DAG" if args.use_dag else "MLP"
+
+    # 2. 确定文件夹名字
+    if args.run_name:
+        # 优先使用命令行指定的自定义名字
+        sub_dir_name = args.run_name
+    else:
+        # 备用方案：算法名 + 时间戳
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        sub_dir_name = f"{algo_name}_{timestamp}"
+
+    # 3. 拼接并创建路径
+    # 注意：这里最好用 args.save_dir (通常是 ./runs)，如果没有定义 save_dir，写死 "./runs" 也没问题
+    run_dir = os.path.join("./runs", args.env_name, sub_dir_name)
     os.makedirs(run_dir, exist_ok=True)
+
+    print(f"📁 Training data will be saved to: {run_dir}")
 
     scores_deque = deque(maxlen=100)
     start_time = time.time()
