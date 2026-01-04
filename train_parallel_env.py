@@ -8,8 +8,9 @@ import argparse
 from tqdm import tqdm
 from datetime import datetime
 import time
-import platform  # <--- 修复: 之前缺失的 platform
-import supersuit as ss  # <--- 修复: 之前缺失的 ss
+import platform
+import supersuit as ss
+import random  # ✅ 新增: 导入 random 库
 from pettingzoo.mpe import simple_tag_v3, simple_spread_v3, simple_adversary_v3
 
 from maddpg import MADDPG, ReplayBuffer
@@ -52,7 +53,7 @@ def create_parallel_env_auto(env_name, max_steps, num_envs):
 
     try:
         vec_env = ss.pettingzoo_env_to_vec_env_v1(env_fn())
-        # ✅ 修复: base_class 改为 'gymnasium' 以支持新版 SuperSuit
+        # base_class 改为 'gymnasium' 以支持新版 SuperSuit
         vec_env = ss.concat_vec_envs_v1(vec_env, num_envs, num_cpus=n_cpus, base_class='gymnasium')
     except Exception as e:
         print(f"⚠️ Error creating envs: {e}. Falling back to single process.")
@@ -60,7 +61,6 @@ def create_parallel_env_auto(env_name, max_steps, num_envs):
             vec_env = ss.pettingzoo_env_to_vec_env_v1(env_fn())
             vec_env = ss.concat_vec_envs_v1(vec_env, num_envs, num_cpus=0, base_class='gymnasium')
         except TypeError:
-            # 如果版本非常老，可能还需要回退到 'gym'，但通常你是新版本
             print("⚠️ 'gymnasium' failed, trying 'gym'...")
             vec_env = ss.pettingzoo_env_to_vec_env_v1(env_fn())
             vec_env = ss.concat_vec_envs_v1(vec_env, num_envs, num_cpus=0, base_class='gym')
@@ -93,16 +93,29 @@ def parse_args():
     parser.add_argument("--render-mode", type=str, default=None, choices=[None, "human", "rgb_array"])
     parser.add_argument("--create-gif", action="store_true", help="Create GIF of episodes")
     parser.add_argument("--use-dag", action="store_true", default=False, help="Use DAG-Attention Critic")
+
+    # ✅ 新增: 接收随机种子参数
+    parser.add_argument("--seed", type=int, default=1, help="Random seed for reproducibility")
+
     return parser.parse_args()
 
 
 def train(args):
+    # ✅ 新增: 锁定所有随机种子，确保实验可复现
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    print(f"🎲 Random Seed set to: {args.seed}")
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # 修改实验名称，自动加上 seed，方便你区分文件
     if args.run_name:
-        experiment_name = f"{args.run_name}_{timestamp}"
+        experiment_name = f"{args.run_name}_seed{args.seed}_{timestamp}"
     else:
         dag_tag = "DAG" if args.use_dag else "MLP"
-        experiment_name = f"parallel_{dag_tag}_envs{args.num_envs}_bs{args.batch_size}_{timestamp}"
+        experiment_name = f"parallel_{dag_tag}_seed{args.seed}_envs{args.num_envs}_{timestamp}"
 
     logger = Logger(run_name=experiment_name, folder="runs", algo="MADDPG", env=args.env_name)
     logger.log_all_hyperparameters(vars(args))
@@ -150,8 +163,8 @@ def train(args):
         agents=agents, state_sizes=state_sizes, action_sizes=action_sizes
     )
 
-    print(f"🚀 Starting Training on {platform.system()} | GPU: {torch.cuda.get_device_name(0)}")
-    print(f"   Mode: {'DAG' if args.use_dag else 'MLP'} | Envs: {num_envs} | Batch: {args.batch_size}")
+    print(f"🚀 Starting Training on {platform.system()} | GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+    print(f"   Mode: {'DAG' if args.use_dag else 'MLP'} | Envs: {num_envs} | Batch: {args.batch_size} | Seed: {args.seed}")
 
     noise_scale = args.noise_scale
     decay_steps = min(args.noise_decay_steps // num_envs, args.total_steps // num_envs)
@@ -163,7 +176,7 @@ def train(args):
 
     evaluate(env_evaluate, maddpg, logger, record_gif=False, num_eval_episodes=5, global_step=0)
 
-    with tqdm(total=args.total_steps, desc="Training") as pbar:
+    with tqdm(total=args.total_steps, desc=f"Training (Seed {args.seed})") as pbar:
         while global_step < args.total_steps:
             observations, _ = env.reset()
             observations_reshaped = observations.reshape(num_envs, num_agents, -1)
@@ -237,7 +250,17 @@ def train(args):
     env.close()
     env_evaluate.close()
     logger.close()
-    np.save(os.path.join(logger.dir_name, "agent_rewards.npy"), agent_rewards)
+
+    # ✅ 重点: 保存文件时带上 seed，避免覆盖
+    save_file_name = f"agent_rewards_seed{args.seed}.npy"
+    save_path = os.path.join(logger.dir_name, save_file_name)
+    np.save(save_path, agent_rewards)
+    print(f"💾 Results saved to: {save_path}")
+
+    # 为了方便你直接找到，也在当前目录下存一份
+    np.save(save_file_name, agent_rewards)
+    print(f"💾 Also saved copy to current folder: {save_file_name}")
+
     return agent_rewards, experiment_name
 
 
