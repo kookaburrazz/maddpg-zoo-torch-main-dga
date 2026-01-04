@@ -1,7 +1,7 @@
 models/
-logs/
+
 test/
-runs/
+
 old_maddpg/
 .vscode
 
