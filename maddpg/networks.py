@@ -1,232 +1,198 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def init_weights(module, output_layer=None, init_w=3e-3):
-    """Standard weight initialization"""
-    if isinstance(module, nn.Linear):
-        if module == output_layer:
-            nn.init.uniform_(module.weight, -init_w, init_w)
-            nn.init.uniform_(module.bias, -init_w, init_w)
-        else:
-            nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
-            nn.init.zeros_(module.bias)
+def _mlp(in_dim, hidden_sizes, out_dim, act=nn.ReLU, out_act=None):
+    layers = []
+    prev = in_dim
+    for h in hidden_sizes:
+        layers += [nn.Linear(prev, h), act()]
+        prev = h
+    layers.append(nn.Linear(prev, out_dim))
+    if out_act is not None:
+        layers.append(out_act())
+    return nn.Sequential(*layers)
 
 
-def _init_weights_approx(module):
-    """Initialization for Approx Actor"""
-    if isinstance(module, nn.Linear):
-        nn.init.xavier_uniform_(module.weight, gain=1.0)
-        nn.init.constant_(module.bias, 0)
-    if hasattr(module, 'fc3') and module is module.fc3:
-        nn.init.uniform_(module.weight, -3e-3, 3e-3)
-        nn.init.constant_(module.bias, 0)
-
-
-# --- 基础 Actor ---
 class Actor(nn.Module):
-    """Standard Actor (Policy) Model"""
-
-    def __init__(self, state_size, action_size, hidden_sizes=(64, 64), init_w=3e-3,
-                 action_low=-1.0, action_high=1.0):
-        super(Actor, self).__init__()
+    def __init__(self, state_dim, action_dim, hidden_sizes=(256, 256), action_low=-1.0, action_high=1.0):
+        super().__init__()
+        self.net = _mlp(state_dim, hidden_sizes, action_dim, act=nn.ReLU, out_act=None)
         self.action_low = action_low
         self.action_high = action_high
-        self.scale = (action_high - action_low) / 2.0
-        self.bias = (action_high + action_low) / 2.0
 
-        self.fc1 = nn.Linear(state_size, hidden_sizes[0])
-        self.fc2 = nn.Linear(hidden_sizes[0], hidden_sizes[1])
-        self.fc3 = nn.Linear(hidden_sizes[1], action_size)
-
-        self.apply(lambda m: init_weights(m, self.fc3, init_w))
-
-    def forward(self, state):
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
-        x = torch.tanh(self.fc3(x))
-        return self.scale * x + self.bias
-
-
-# --- Approx Actor (恢复这个类以修复 import 错误) ---
-class SafeTanhTransform(torch.distributions.transforms.TanhTransform):
-    def _inverse(self, y):
-        y = torch.clamp(y, -0.999999, 0.999999)
-        return torch.atanh(y)
-
-
-class ApproxActor(nn.Module):
-    """Approximate Actor Network"""
-
-    def __init__(self, state_size, action_size, hidden_sizes=(64, 64), init_w=3e-3,
-                 action_low=-1.0, action_high=1.0):
-        super(ApproxActor, self).__init__()
-        self.fc1 = nn.Linear(state_size, hidden_sizes[0])
-        self.fc2 = nn.Linear(hidden_sizes[0], hidden_sizes[1])
-        self.fc3 = nn.Linear(hidden_sizes[1], action_size * 2)
-
-        self.action_low = action_low
-        self.action_high = action_high
-        self.scale = (action_high - action_low) / 2.0
-        self.bias = (action_high + action_low) / 2.0
-        self.apply(_init_weights_approx)
-
-    def forward(self, state):
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
-        mu, log_std = self.fc3(x).chunk(2, dim=-1)
-        log_std = torch.clamp(log_std, min=-20, max=2)
-        return mu, log_std
-
-    def _get_dist(self, mu, log_std):
-        base_distribution = torch.distributions.Normal(mu, torch.exp(log_std))
-        tanh_transform = SafeTanhTransform(cache_size=1)
-        scale_transform = torch.distributions.transforms.AffineTransform(self.bias, self.scale)
-        return torch.distributions.TransformedDistribution(base_distribution,
-                                                           [tanh_transform, scale_transform]), base_distribution
-
-    def sample(self, state, deterministic=False):
-        mu, log_std = self.forward(state)
-        if deterministic:
-            return torch.tanh(mu) * self.scale + self.bias, None, None
-        dist, base_dist = self._get_dist(mu, log_std)
-        action = dist.sample()
-        log_prob = dist.log_prob(action).sum(-1, keepdim=True)
-        entropy = base_dist.entropy().sum(-1, keepdim=True)
-        return action, log_prob, entropy
-
-
-# --- 核心组件：DGA Encoder (完全修复版) ---
-class DGACriticEncoder(nn.Module):
-    def __init__(self, state_sizes, action_sizes, agent_groups, head_dim=128):
-        super(DGACriticEncoder, self).__init__()
-        self.state_sizes = state_sizes
-        self.action_sizes = action_sizes
-        self.num_agents = len(state_sizes)
-        self.agent_groups = agent_groups
-        self.head_dim = head_dim
-
-        # Assume uniform feature size for simplicity (sum of state+action dims)
-        # 如果你的 Agent state 维度不同，这里可能需要 Padding 或 Projection
-        self.D_feat = state_sizes[0] + action_sizes[0]
-
-        self.W_Q = nn.Linear(self.D_feat, head_dim)
-        self.W_Self = nn.Linear(self.D_feat, head_dim)
-
-        self.W_K_team = nn.Linear(self.D_feat, head_dim)
-        self.W_V_team = nn.Linear(self.D_feat, head_dim)
-        self.gating_team = nn.Sequential(nn.Linear(head_dim, head_dim), nn.Sigmoid())
-
-        self.W_K_opp = nn.Linear(self.D_feat, head_dim)
-        self.W_V_opp = nn.Linear(self.D_feat, head_dim)
-        self.gating_opp = nn.Sequential(nn.Linear(head_dim, head_dim), nn.Sigmoid())
-
-        self.output_linear = nn.Linear(head_dim * 3, head_dim)
-
-    def forward(self, states_full, actions_full, current_agent_idx=0):
-        # 1. 拆分 Full State 和 Full Action
-        # states_full shape: (batch, sum(state_sizes))
-        states_list = torch.split(states_full, self.state_sizes, dim=1)
-        actions_list = torch.split(actions_full, self.action_sizes, dim=1)
-
-        # 2. 拼接每个 Agent 的特征 (State + Action)
-        X_list = [torch.cat([s, a], dim=1) for s, a in zip(states_list, actions_list)]
-
-        # 3. 找到当前 Agent 的特征
-        curr_feat = X_list[current_agent_idx]
-
-        # 4. 确定当前 Agent 的分组 ID
-        curr_group_id = None
-        for idx, g in enumerate(self.agent_groups):
-            if current_agent_idx in g:
-                curr_group_id = idx
-                break
-
-        if curr_group_id is None:
-            raise ValueError(f"Agent {current_agent_idx} not found in any group!")
-
-        # 5. 分离队友和敌人
-        team_feats_list = []
-        opp_feats_list = []
-        for i in range(self.num_agents):
-            if i == current_agent_idx: continue
-
-            # 修复逻辑：判断 i 是否在当前组的名单里
-            # self.agent_groups[curr_group_id] 是一个列表，例如 [0, 1, 2]
-            if i in self.agent_groups[curr_group_id]:
-                team_feats_list.append(X_list[i])
-            else:
-                opp_feats_list.append(X_list[i])
-
-        # 6. Self Attention 编码
-        feat_self = F.relu(self.W_Self(curr_feat))
-        Q = self.W_Q(curr_feat).unsqueeze(1)  # (batch, 1, head_dim)
-
-        # 7. Team Attention
-        if team_feats_list:
-            X_team = torch.stack(team_feats_list, dim=1)  # (batch, num_team, D_feat)
-            K = self.W_K_team(X_team)
-            V = self.W_V_team(X_team)
-            scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
-            attn_weights = F.softmax(scores, dim=-1)
-            feat_team = torch.matmul(attn_weights, V).squeeze(1)
-            feat_team = feat_team * self.gating_team(feat_team)
-        else:
-            feat_team = torch.zeros_like(feat_self)
-
-        # 8. Opponent Attention
-        if opp_feats_list:
-            X_opp = torch.stack(opp_feats_list, dim=1)
-            K = self.W_K_opp(X_opp)
-            V = self.W_V_opp(X_opp)
-            scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
-            attn_weights = F.softmax(scores, dim=-1)
-            feat_opp = torch.matmul(attn_weights, V).squeeze(1)
-            feat_opp = feat_opp * self.gating_opp(feat_opp)
-        else:
-            feat_opp = torch.zeros_like(feat_self)
-
-        # 9. 输出
-        return self.output_linear(torch.cat([feat_self, feat_team, feat_opp], dim=1))
-
-
-# --- Critic 类定义 ---
-class DGACritic(nn.Module):
-    """New DAG-Attention Critic"""
-
-    def __init__(self, state_sizes, action_sizes, agent_groups, hidden_sizes=(64, 64),
-                 init_w=3e-3, head_dim=128):
-        super(DGACritic, self).__init__()
-        self.dga_encoder = DGACriticEncoder(state_sizes, action_sizes, agent_groups, head_dim)
-        self.fc2 = nn.Linear(head_dim, hidden_sizes[1])
-        self.fc3 = nn.Linear(hidden_sizes[1], 1)
-        self.apply(lambda m: init_weights(m, self.fc3, init_w))
-
-    def forward(self, state, action, current_agent_idx=0):
-        # 这里的 state, action 其实是 full_state, full_action
-        x = self.dga_encoder(state, action, current_agent_idx)
-        x = F.relu(self.fc2(x))
-        return self.fc3(x)
+    def forward(self, s):
+        a = torch.tanh(self.net(s))  # [-1, 1]
+        # scale to [low, high] if needed
+        if self.action_low == -1.0 and self.action_high == 1.0:
+            return a
+        return (a + 1.0) * 0.5 * (self.action_high - self.action_low) + self.action_low
 
 
 class MLPCritic(nn.Module):
-    """Standard MLP Critic"""
+    """
+    Standard centralized critic: Q(s_all, a_all)
+    NOTE: accepts an optional agent_idx and ignores it to be API-compatible.
+    """
 
-    def __init__(self, total_state_size, total_action_size, hidden_sizes=(64, 64), init_w=3e-3):
-        super(MLPCritic, self).__init__()
-        self.fc1 = nn.Linear(total_state_size + total_action_size, hidden_sizes[0])
-        self.fc2 = nn.Linear(hidden_sizes[0], hidden_sizes[1])
-        self.fc3 = nn.Linear(hidden_sizes[1], 1)
-        self.apply(lambda m: init_weights(m, self.fc3, init_w))
+    def __init__(self, total_state_dim, total_action_dim, hidden_sizes=(256, 256)):
+        super().__init__()
+        self.q = _mlp(total_state_dim + total_action_dim, hidden_sizes, 1, act=nn.ReLU)
 
-    def forward(self, state, action, current_agent_idx=None):
-        x = torch.cat([state, action], dim=1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return self.fc3(x)
+    def forward(self, states_full, actions_full, agent_idx=None):
+        x = torch.cat([states_full, actions_full], dim=1)
+        return self.q(x)
 
 
-# --- 别名定义 ---
-Critic = MLPCritic
+class _DotAttention(nn.Module):
+    """
+    Single-query dot-product attention over a set of tokens.
+    query: [B, d]
+    keys/values: [B, M, d]
+    returns: summary [B, d]
+    """
+
+    def __init__(self, d_model):
+        super().__init__()
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.scale = 1.0 / math.sqrt(d_model)
+
+    def forward(self, query, tokens):
+        # tokens: [B, M, d]
+        if tokens is None or tokens.size(1) == 0:
+            return torch.zeros_like(query)
+
+        q = self.q_proj(query).unsqueeze(1)      # [B, 1, d]
+        k = self.k_proj(tokens)                  # [B, M, d]
+        v = self.v_proj(tokens)                  # [B, M, d]
+
+        attn_logits = (q * k).sum(dim=-1) * self.scale  # [B, M]
+        w = torch.softmax(attn_logits, dim=-1).unsqueeze(-1)  # [B, M, 1]
+        return (w * v).sum(dim=1)  # [B, d]
+
+
+class DGACritic(nn.Module):
+    """
+    Decoupled Gated Attention critic:
+      - builds per-agent token embeddings from (s_i, a_i)
+      - decouples ally/adv sets based on agent_groups
+      - gated fusion (or fixed 0.5 if dag_no_gate)
+    """
+
+    def __init__(
+        self,
+        state_sizes,
+        action_sizes,
+        agent_groups,
+        hidden_sizes=(256, 256),
+        d_model=128,
+        dag_no_gate=False,
+        dag_no_decouple=False,
+    ):
+        super().__init__()
+        self.state_sizes = list(state_sizes)
+        self.action_sizes = list(action_sizes)
+        self.agent_groups = [list(g) for g in agent_groups]
+        self.num_agents = len(self.state_sizes)
+
+        self.d_model = d_model
+        self.dag_no_gate = dag_no_gate
+        self.dag_no_decouple = dag_no_decouple
+
+        # slices for splitting full vectors
+        self.state_splits = self.state_sizes
+        self.action_splits = self.action_sizes
+
+        # token embed per agent from concat(s_i, a_i)
+        self.token_proj = nn.ModuleList([
+            nn.Linear(self.state_sizes[i] + self.action_sizes[i], d_model)
+            for i in range(self.num_agents)
+        ])
+
+        # attention modules (ally/adv)
+        self.attn_ally = _DotAttention(d_model)
+        self.attn_adv = _DotAttention(d_model)
+
+        # gate
+        self.gate = nn.Linear(2 * d_model, d_model)
+
+        # output Q network
+        # Input: [s_i, a_i, E_i] where E_i is fused context
+        self.q_mlp = _mlp(self.state_sizes[0] + self.action_sizes[0] + d_model, hidden_sizes, 1, act=nn.ReLU)
+
+        # NOTE: state/action dims can differ by agent; simplest is build per-agent q heads.
+        # To keep it robust, create per-agent q heads.
+        self.q_heads = nn.ModuleList([
+            _mlp(self.state_sizes[i] + self.action_sizes[i] + d_model, hidden_sizes, 1, act=nn.ReLU)
+            for i in range(self.num_agents)
+        ])
+
+    def _agent_group_id(self, agent_idx: int) -> int:
+        for gid, g in enumerate(self.agent_groups):
+            if agent_idx in g:
+                return gid
+        # fallback: everyone in one group
+        return 0
+
+    def _split_full(self, states_full, actions_full):
+        # returns lists of tensors per agent
+        s_list = list(torch.split(states_full, self.state_splits, dim=1))
+        a_list = list(torch.split(actions_full, self.action_splits, dim=1))
+        return s_list, a_list
+
+    def forward(self, states_full, actions_full, current_agent_idx: int):
+        """
+        states_full: [B, sum(state_dims)]
+        actions_full: [B, sum(action_dims)]
+        current_agent_idx: int
+        """
+        s_list, a_list = self._split_full(states_full, actions_full)
+
+        # build token embeddings for all agents
+        tokens = []
+        for i in range(self.num_agents):
+            tok_in = torch.cat([s_list[i], a_list[i]], dim=1)  # [B, s_i+a_i]
+            tok = torch.relu(self.token_proj[i](tok_in))       # [B, d]
+            tokens.append(tok)
+
+        i = current_agent_idx
+        query = tokens[i]  # [B, d]
+
+        # build sets
+        others = [j for j in range(self.num_agents) if j != i]
+        if self.dag_no_decouple:
+            # one shared stream over all others
+            all_tokens = torch.stack([tokens[j] for j in others], dim=1) if len(others) > 0 else None
+            h_all = self.attn_ally(query, all_tokens)  # reuse module
+            E = h_all
+        else:
+            gid = self._agent_group_id(i)
+            ally = [j for j in others if self._agent_group_id(j) == gid]
+            adv = [j for j in others if self._agent_group_id(j) != gid]
+
+            ally_tokens = torch.stack([tokens[j] for j in ally], dim=1) if len(ally) > 0 else torch.zeros(
+                (query.size(0), 0, self.d_model), device=query.device
+            )
+            adv_tokens = torch.stack([tokens[j] for j in adv], dim=1) if len(adv) > 0 else torch.zeros(
+                (query.size(0), 0, self.d_model), device=query.device
+            )
+
+            h_ally = self.attn_ally(query, ally_tokens)
+            h_adv = self.attn_adv(query, adv_tokens)
+
+            if self.dag_no_gate:
+                E = 0.5 * h_ally + 0.5 * h_adv
+            else:
+                z = torch.sigmoid(self.gate(torch.cat([h_ally, h_adv], dim=1)))  # [B, d]
+                E = z * h_ally + (1.0 - z) * h_adv
+
+        # per-agent head: Q_i(s_i, a_i, E)
+        sa_i = torch.cat([s_list[i], a_list[i], E], dim=1)
+        q = self.q_heads[i](sa_i)
+        return q

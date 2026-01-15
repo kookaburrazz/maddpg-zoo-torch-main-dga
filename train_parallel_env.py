@@ -10,7 +10,7 @@ from datetime import datetime
 import time
 import platform
 import supersuit as ss
-import random  # ✅ 新增: 导入 random 库
+import random
 from pettingzoo.mpe import simple_tag_v3, simple_spread_v3, simple_adversary_v3
 
 from maddpg import MADDPG, ReplayBuffer
@@ -42,26 +42,24 @@ def create_parallel_env_auto(env_name, max_steps, num_envs):
         env = ss.pad_action_space_v0(env)
         return env
 
-    # 检测操作系统
     system_name = platform.system()
     if system_name == "Windows":
-        print(f"🖥️  Windows detected: Using Serial Execution (num_cpus=0) to prevent crashes.")
+        print("  Windows detected: Using Serial Execution (num_cpus=0) to prevent crashes.")
         n_cpus = 0
     else:
-        print(f"🐧 Linux/Unix detected: Using Parallel Execution (num_cpus={num_envs}) for max speed.")
+        print(f" Linux/Unix detected: Using Parallel Execution (num_cpus={num_envs}) for max speed.")
         n_cpus = num_envs
 
     try:
         vec_env = ss.pettingzoo_env_to_vec_env_v1(env_fn())
-        # base_class 改为 'gymnasium' 以支持新版 SuperSuit
         vec_env = ss.concat_vec_envs_v1(vec_env, num_envs, num_cpus=n_cpus, base_class='gymnasium')
     except Exception as e:
-        print(f"⚠️ Error creating envs: {e}. Falling back to single process.")
+        print(f" Error creating envs: {e}. Falling back to single process.")
         try:
             vec_env = ss.pettingzoo_env_to_vec_env_v1(env_fn())
             vec_env = ss.concat_vec_envs_v1(vec_env, num_envs, num_cpus=0, base_class='gymnasium')
         except TypeError:
-            print("⚠️ 'gymnasium' failed, trying 'gym'...")
+            print(" 'gymnasium' failed, trying 'gym'...")
             vec_env = ss.pettingzoo_env_to_vec_env_v1(env_fn())
             vec_env = ss.concat_vec_envs_v1(vec_env, num_envs, num_cpus=0, base_class='gym')
 
@@ -92,40 +90,53 @@ def parse_args():
     parser.add_argument("--eval-interval", type=int, default=5000, help="Evaluate every n steps")
     parser.add_argument("--render-mode", type=str, default=None, choices=[None, "human", "rgb_array"])
     parser.add_argument("--create-gif", action="store_true", help="Create GIF of episodes")
-    parser.add_argument("--use-dag", action="store_true", default=False, help="Use DAG-Attention Critic")
 
-    # ✅ 新增: 接收随机种子参数
+    # DAG switches
+    parser.add_argument("--use-dag", action="store_true", default=False, help="Use DAG-Attention Critic")
+    parser.add_argument("--dag-no-gate", action="store_true", help="Ablate gating (fixed 0.5)")
+    parser.add_argument("--dag-no-decouple", action="store_true", help="Ablate decoupling (shared attention)")
+
+    # Seed
     parser.add_argument("--seed", type=int, default=1, help="Random seed for reproducibility")
 
     return parser.parse_args()
 
 
 def train(args):
-    # ✅ 新增: 锁定所有随机种子，确保实验可复现
+    # Lock random seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    print(f"🎲 Random Seed set to: {args.seed}")
+    print(f"[Seed] Random Seed set to: {args.seed}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # 修改实验名称，自动加上 seed，方便你区分文件
-    if args.run_name:
-        experiment_name = f"{args.run_name}_seed{args.seed}_{timestamp}"
+
+    # Build dag tag for run naming
+    if args.use_dag:
+        dag_tag = "DAG"
+        if args.dag_no_gate:
+            dag_tag += "_NoGate"
+        if args.dag_no_decouple:
+            dag_tag += "_NoDecouple"
     else:
-        dag_tag = "DAG" if args.use_dag else "MLP"
+        dag_tag = "MLP"
+
+    if args.run_name:
+        experiment_name = f"{args.run_name}_{dag_tag}_seed{args.seed}_{timestamp}"
+    else:
         experiment_name = f"parallel_{dag_tag}_seed{args.seed}_envs{args.num_envs}_{timestamp}"
 
     logger = Logger(run_name=experiment_name, folder="runs", algo="MADDPG", env=args.env_name)
     logger.log_all_hyperparameters(vars(args))
 
-    # 获取环境信息
+    # env info
     agents, num_agents, action_sizes, action_low, action_high, state_sizes = get_env_info(
         env_name=args.env_name, max_steps=args.max_steps, apply_padding=True
     )
 
-    # 智能体分组逻辑
+    # grouping
     if "spread" in args.env_name:
         agent_groups = [list(range(num_agents))]
     elif "tag" in args.env_name:
@@ -137,11 +148,11 @@ def train(args):
 
     print(f"Agent Groups: {agent_groups}")
 
-    # 创建并行环境 (Auto-Detect)
+    # parallel env
     num_envs = max(1, args.num_envs)
     env = create_parallel_env_auto(args.env_name, args.max_steps, num_envs)
 
-    # 评估环境
+    # eval env
     from utils.env import create_single_env
     env_evaluate = create_single_env(args.env_name, args.max_steps, "rgb_array", True)
 
@@ -151,20 +162,34 @@ def train(args):
 
     hidden_sizes = tuple(map(int, args.hidden_sizes.split(',')))
 
+    # ✅ IMPORTANT: pass ablation flags into MADDPG
     maddpg = MADDPG(
-        state_sizes=state_sizes, action_sizes=action_sizes, hidden_sizes=hidden_sizes,
-        actor_lr=args.actor_lr, critic_lr=args.critic_lr, gamma=args.gamma, tau=args.tau,
-        action_low=action_low, action_high=action_high, agent_groups=agent_groups,
-        use_dag_attention=args.use_dag
+        state_sizes=state_sizes,
+        action_sizes=action_sizes,
+        hidden_sizes=hidden_sizes,
+        actor_lr=args.actor_lr,
+        critic_lr=args.critic_lr,
+        gamma=args.gamma,
+        tau=args.tau,
+        action_low=action_low,
+        action_high=action_high,
+        agent_groups=agent_groups,
+        use_dag_attention=args.use_dag,
+        dag_no_gate=args.dag_no_gate,
+        dag_no_decouple=args.dag_no_decouple,
     )
 
     buffer = ReplayBuffer(
-        buffer_size=min(args.buffer_size, args.total_steps), batch_size=args.batch_size,
-        agents=agents, state_sizes=state_sizes, action_sizes=action_sizes
+        buffer_size=min(args.buffer_size, args.total_steps),
+        batch_size=args.batch_size,
+        agents=agents,
+        state_sizes=state_sizes,
+        action_sizes=action_sizes
     )
 
-    print(f"🚀 Starting Training on {platform.system()} | GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
-    print(f"   Mode: {'DAG' if args.use_dag else 'MLP'} | Envs: {num_envs} | Batch: {args.batch_size} | Seed: {args.seed}")
+    print(" [Train]Starting Training on {platform.system()} | GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+    print(f"   Mode: {dag_tag} | Envs: {num_envs} | Batch: {args.batch_size} | Seed: {args.seed}")
+    print(f"   DAG flags: no_gate={args.dag_no_gate}, no_decouple={args.dag_no_decouple}")
 
     noise_scale = args.noise_scale
     decay_steps = min(args.noise_decay_steps // num_envs, args.total_steps // num_envs)
@@ -222,12 +247,14 @@ def train(args):
 
                 global_step += num_envs
                 pbar.update(num_envs)
-                if any(dones): break
+                if any(dones):
+                    break
 
             for agent_idx in range(num_agents):
                 mean_r = np.mean(episode_rewards[:, agent_idx])
                 agent_rewards[agent_idx].append(
-                    [mean_r, np.min(episode_rewards[:, agent_idx]), np.max(episode_rewards[:, agent_idx])])
+                    [mean_r, np.min(episode_rewards[:, agent_idx]), np.max(episode_rewards[:, agent_idx])]
+                )
                 logger.add_scalar(f'{agents[agent_idx]}/episode_reward', mean_r, global_step)
 
             logger.add_scalar('noise/scale', noise_scale, global_step)
@@ -237,29 +264,29 @@ def train(args):
             if global_step % eval_interval == 0:
                 maddpg.save(model_path)
                 create_gif = args.create_gif and (global_step % (eval_interval * 4) == 0)
-                avg_eval_rewards = evaluate(env_evaluate, maddpg, logger,
-                                            num_eval_episodes=5, record_gif=create_gif, global_step=global_step)
+                avg_eval_rewards = evaluate(
+                    env_evaluate, maddpg, logger,
+                    num_eval_episodes=5, record_gif=create_gif, global_step=global_step
+                )
 
                 score = np.sum(avg_eval_rewards)
                 if score > best_score:
                     best_score = score
                     maddpg.save(best_model_path)
-                    print(f"🔥 New Best: {best_score:.2f}")
+                    print(f"[Best]New Best: {best_score:.2f}")
 
     maddpg.save(model_path)
     env.close()
     env_evaluate.close()
     logger.close()
 
-    # ✅ 重点: 保存文件时带上 seed，避免覆盖
     save_file_name = f"agent_rewards_seed{args.seed}.npy"
     save_path = os.path.join(logger.dir_name, save_file_name)
     np.save(save_path, agent_rewards)
-    print(f"💾 Results saved to: {save_path}")
+    print(f"[Save] Results saved to: {save_path}")
 
-    # 为了方便你直接找到，也在当前目录下存一份
     np.save(save_file_name, agent_rewards)
-    print(f"💾 Also saved copy to current folder: {save_file_name}")
+    print(f"[Save] Also saved copy to current folder: {save_file_name}")
 
     return agent_rewards, experiment_name
 
