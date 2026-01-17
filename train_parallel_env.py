@@ -1,18 +1,22 @@
 """
-Training script for MADDPG with PettingZoo using parallel environments (Auto-Detect + Fixes)
+Training script for MADDPG with PettingZoo using parallel environments
+- Works on Linux + Windows
+- Fixes Supersuit vec-env issues that cause "Killed" on simple_spread_v3
+- Avoids emoji/Unicode print crashes on Windows consoles
 """
 
-import torch
-import numpy as np
 import os
 import argparse
-from tqdm import tqdm
-from datetime import datetime
-import time
-import platform
-import supersuit as ss
 import random
+import platform
+import time
+from datetime import datetime
 
+import numpy as np
+import torch
+from tqdm import tqdm
+
+import supersuit as ss
 from pettingzoo.mpe import simple_tag_v3, simple_spread_v3, simple_adversary_v3
 
 from maddpg import MADDPG, ReplayBuffer
@@ -21,29 +25,25 @@ from utils.logger import Logger
 from utils.utils import evaluate
 
 
-def create_parallel_env_auto(env_name, max_steps, num_envs):
+# -------------------------
+# Helpers
+# -------------------------
+def safe_print(msg: str):
     """
-    Auto-configures PettingZoo parallel envs with SuperSuit vectorization.
-
-    Windows:
-      - Force serial execution (num_cpus=0) for stability.
-
-    Linux/Unix:
-      - Default: use multiprocessing (num_cpus=num_envs) for speed
-      - BUT for simple_spread_v3: force serial execution (num_cpus=0)
-        to avoid SuperSuit async constructor issues
-        (e.g., missing obs_space/act_space).
-
-    NOTE:
-      - num_envs stays the same (still concatenating N envs)
-      - only changes how concat_vec_envs_v1 parallelizes construction.
+    Avoid Windows cp1252 UnicodeEncodeError and random console encoding issues.
     """
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        print(msg.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore"))
+
+
+def build_env_fn(env_name: str, max_steps: int):
     ENV_MODULES = {
         "simple_tag_v3": simple_tag_v3,
         "simple_spread_v3": simple_spread_v3,
         "simple_adversary_v3": simple_adversary_v3,
     }
-
     if env_name not in ENV_MODULES:
         raise ValueError(f"Environment {env_name} not manually supported yet.")
 
@@ -55,52 +55,58 @@ def create_parallel_env_auto(env_name, max_steps, num_envs):
         env = ss.pad_action_space_v0(env)
         return env
 
+    return env_fn
+
+
+def create_parallel_env_auto(env_name: str, max_steps: int, num_envs: int):
+    """
+    IMPORTANT FIX:
+      - simple_spread_v3 sometimes crashes / gets SIGKILL when using supersuit concat_vec_envs
+        depending on supersuit/gymnasium versions and multiprocessing settings.
+      - For stability, we disable concat for simple_spread_v3 and run a single vec env.
+        (Baseline and DAG both use the same env pipeline => fair comparison.)
+    """
+
+    env_fn = build_env_fn(env_name, max_steps)
+
     system_name = platform.system()
 
-    # Decide num_cpus
+    # Always create a base vec env (single)
+    base_vec = ss.pettingzoo_env_to_vec_env_v1(env_fn())
+
+    # ---- Special-case: simple_spread_v3 stable mode (NO concat) ----
+    if env_name == "simple_spread_v3":
+        safe_print("simple_spread_v3: using SINGLE vec env (no concat_vec_envs) for stability.")
+        return base_vec
+
+    # ---- Other envs: try concat_vec_envs for speed ----
     if system_name == "Windows":
-        print("Windows detected: forcing serial execution (num_cpus=0) for stability.")
+        # Multiprocessing can be flaky on Windows; use serial
+        safe_print("Windows detected: using serial vec env (num_cpus=0) for stability.")
         n_cpus = 0
     else:
-        # Linux/Unix
-        if env_name == "simple_spread_v3":
-            print("Linux/Unix + simple_spread_v3: forcing serial execution (num_cpus=0) for stability.")
-            n_cpus = 0
-        else:
-            print(f"Linux/Unix detected: using parallel execution (num_cpus={num_envs}) for speed.")
-            n_cpus = num_envs
+        safe_print(f"Linux/Unix detected: using concat_vec_envs (num_cpus={num_envs}).")
+        n_cpus = max(0, int(num_envs))
 
-    def _make_vec(base_class: str, num_cpus: int):
-        venv = ss.pettingzoo_env_to_vec_env_v1(env_fn())
-        venv = ss.concat_vec_envs_v1(
-            venv,
-            num_envs,
-            num_cpus=num_cpus,
-            base_class=base_class,
-        )
-        return venv
-
-    # Try desired mode first (prefer base_class='gym' for compatibility)
+    # Prefer gymnasium base_class
     try:
-        return _make_vec(base_class="gym", num_cpus=n_cpus)
-    except Exception as e1:
-        print(f"[VecEnv] Failed: base_class='gym', num_cpus={n_cpus}. Error: {e1}")
-
-    try:
-        return _make_vec(base_class="gymnasium", num_cpus=n_cpus)
-    except Exception as e2:
-        print(f"[VecEnv] Failed: base_class='gymnasium', num_cpus={n_cpus}. Error: {e2}")
-
-    # Fallback: serial execution
-    print("[VecEnv] Falling back to serial execution (num_cpus=0).")
-    try:
-        return _make_vec(base_class="gym", num_cpus=0)
-    except Exception as e3:
-        print(f"[VecEnv] Serial failed: base_class='gym'. Error: {e3}")
-
-    return _make_vec(base_class="gymnasium", num_cpus=0)
+        vec_env = ss.concat_vec_envs_v1(base_vec, num_envs, num_cpus=n_cpus, base_class="gymnasium")
+        return vec_env
+    except Exception as e:
+        safe_print(f"[WARN] concat_vec_envs_v1 failed with gymnasium: {e}")
+        safe_print("[WARN] Falling back to serial concat (num_cpus=0, base_class='gymnasium').")
+        try:
+            vec_env = ss.concat_vec_envs_v1(base_vec, num_envs, num_cpus=0, base_class="gymnasium")
+            return vec_env
+        except Exception as e2:
+            safe_print(f"[WARN] serial concat_vec_envs_v1 still failed: {e2}")
+            safe_print("[WARN] Falling back to SINGLE vec env (no concat).")
+            return base_vec
 
 
+# -------------------------
+# Args
+# -------------------------
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -142,6 +148,9 @@ def parse_args():
     return parser.parse_args()
 
 
+# -------------------------
+# Train
+# -------------------------
 def train(args):
     # Lock random seeds
     torch.manual_seed(args.seed)
@@ -149,7 +158,7 @@ def train(args):
     random.seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    print(f"[Seed] Random Seed set to: {args.seed}")
+    safe_print(f"[Seed] Random Seed set to: {args.seed}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -186,14 +195,26 @@ def train(args):
     else:
         agent_groups = [list(range(num_agents))]
 
-    print(f"Agent Groups: {agent_groups}")
+    safe_print(f"Agent Groups: {agent_groups}")
 
-    # parallel env
-    num_envs = max(1, args.num_envs)
-    env = create_parallel_env_auto(args.env_name, args.max_steps, num_envs)
+    # parallel env (auto)
+    num_envs_req = max(1, int(args.num_envs))
+    env = create_parallel_env_auto(args.env_name, args.max_steps, num_envs_req)
+
+    # IMPORTANT:
+    # If create_parallel_env_auto returned a SINGLE vec env for simple_spread_v3,
+    # then the real num_envs is 1 for shaping / stepping.
+    real_num_envs = num_envs_req
+    try:
+        # Gymnasium VecEnv typically has num_envs attribute
+        if hasattr(env, "num_envs"):
+            real_num_envs = int(env.num_envs)
+    except Exception:
+        pass
 
     # eval env
     from utils.env import create_single_env
+
     env_evaluate = create_single_env(args.env_name, args.max_steps, "rgb_array", True)
 
     model_path = os.path.join(logger.dir_name, "model.pt")
@@ -202,7 +223,7 @@ def train(args):
 
     hidden_sizes = tuple(map(int, args.hidden_sizes.split(",")))
 
-    # IMPORTANT: pass ablation flags into MADDPG
+    # Model
     maddpg = MADDPG(
         state_sizes=state_sizes,
         action_sizes=action_sizes,
@@ -219,6 +240,7 @@ def train(args):
         dag_no_decouple=args.dag_no_decouple,
     )
 
+    # Replay buffer
     buffer = ReplayBuffer(
         buffer_size=min(args.buffer_size, args.total_steps),
         batch_size=args.batch_size,
@@ -227,59 +249,64 @@ def train(args):
         action_sizes=action_sizes,
     )
 
-    print(
-        f"[Train] Starting Training on {platform.system()} | GPU: "
-        f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}"
-    )
-    print(f"Mode: {dag_tag} | Envs: {num_envs} | Batch: {args.batch_size} | Seed: {args.seed}")
-    print(f"DAG flags: no_gate={args.dag_no_gate}, no_decouple={args.dag_no_decouple}")
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    safe_print(f"[Train] Starting Training on {platform.system()} | GPU: {gpu_name}")
+    safe_print(f"   Mode: {dag_tag} | Envs(requested): {num_envs_req} | Envs(actual): {real_num_envs}")
+    safe_print(f"   Batch: {args.batch_size} | Seed: {args.seed}")
+    safe_print(f"   DAG flags: no_gate={args.dag_no_gate}, no_decouple={args.dag_no_decouple}")
 
-    noise_scale = args.noise_scale
-    decay_steps = min(args.noise_decay_steps // num_envs, args.total_steps // num_envs)
-    noise_decay = (args.noise_scale - args.min_noise) / max(1, decay_steps)
+    noise_scale = float(args.noise_scale)
+    # decay steps should respect actual env count
+    decay_steps = min(args.noise_decay_steps // max(1, real_num_envs), args.total_steps // max(1, real_num_envs))
+    decay_steps = max(1, int(decay_steps))
+    noise_decay = (args.noise_scale - args.min_noise) / decay_steps
 
     agent_rewards = [[] for _ in range(len(agents))]
     global_step = 0
-    eval_interval = max(1, (args.eval_interval // num_envs) * num_envs)
+    # eval_interval in terms of env-steps (global_step counts env transitions)
+    eval_interval = max(1, (args.eval_interval // max(1, real_num_envs)) * max(1, real_num_envs))
 
-    # initial eval
+    # Initial eval
     evaluate(env_evaluate, maddpg, logger, record_gif=False, num_eval_episodes=5, global_step=0)
 
     with tqdm(total=args.total_steps, desc=f"Training (Seed {args.seed})") as pbar:
         while global_step < args.total_steps:
             observations, _ = env.reset()
-            observations_reshaped = observations.reshape(num_envs, num_agents, -1)
-            episode_rewards = np.zeros((num_envs, num_agents))
+            observations_reshaped = observations.reshape(real_num_envs, num_agents, -1)
+            episode_rewards = np.zeros((real_num_envs, num_agents), dtype=np.float32)
 
-            for step in range(args.max_steps):
+            for _step in range(args.max_steps):
                 states_batched = [observations_reshaped[:, i, :] for i in range(num_agents)]
                 actions_batched = maddpg.act(states_batched, add_noise=True, noise_scale=noise_scale)
-                actions_stacked = np.stack(actions_batched, axis=1)
-                actions_array = actions_stacked.reshape(num_envs * num_agents, -1)
 
-                next_observations, rewards, terminations, truncations, infos = env.step(actions_array)
+                actions_stacked = np.stack(actions_batched, axis=1)  # [E, N, A]
+                actions_array = actions_stacked.reshape(real_num_envs * num_agents, -1)
+
+                next_obs, rewards, terminations, truncations, infos = env.step(actions_array)
                 dones = np.logical_or(terminations, truncations)
 
-                next_observations_reshaped = next_observations.reshape(num_envs, num_agents, -1)
-                rewards_reshaped = rewards.reshape(num_envs, num_agents)
-                terminations_reshaped = terminations.reshape(num_envs, num_agents)
+                next_obs_reshaped = next_obs.reshape(real_num_envs, num_agents, -1)
+                rewards_reshaped = rewards.reshape(real_num_envs, num_agents)
+                terminations_reshaped = terminations.reshape(real_num_envs, num_agents)
 
-                for env_idx in range(num_envs):
+                # store transitions
+                for env_idx in range(real_num_envs):
                     buffer.add(
                         states=observations_reshaped[env_idx],
                         actions=actions_stacked[env_idx],
                         rewards=rewards_reshaped[env_idx],
-                        next_states=next_observations_reshaped[env_idx],
+                        next_states=next_obs_reshaped[env_idx],
                         dones=terminations_reshaped[env_idx],
                     )
 
                 episode_rewards += rewards_reshaped
-                observations_reshaped = next_observations_reshaped
+                observations_reshaped = next_obs_reshaped
 
+                # learn
                 if len(buffer) > args.batch_size and global_step % args.update_every == 0:
-                    for _ in range(args.num_updates):
+                    for _u in range(args.num_updates):
+                        experiences = buffer.sample()
                         for i in range(num_agents):
-                            experiences = buffer.sample()
                             critic_loss, actor_loss = maddpg.learn(experiences, i)
                             if global_step % 100 == 0:
                                 logger.add_scalar(f"{agents[i]}/critic_loss", critic_loss, global_step)
@@ -289,26 +316,29 @@ def train(args):
                 if args.use_noise_decay:
                     noise_scale = max(args.min_noise, noise_scale - noise_decay)
 
-                global_step += num_envs
-                pbar.update(num_envs)
+                global_step += real_num_envs
+                pbar.update(real_num_envs)
 
-                if any(dones):
+                if np.any(dones):
                     break
 
+            # log episode rewards
             for agent_idx in range(num_agents):
-                mean_r = np.mean(episode_rewards[:, agent_idx])
+                mean_r = float(np.mean(episode_rewards[:, agent_idx]))
                 agent_rewards[agent_idx].append(
-                    [mean_r, np.min(episode_rewards[:, agent_idx]), np.max(episode_rewards[:, agent_idx])]
+                    [mean_r, float(np.min(episode_rewards[:, agent_idx])), float(np.max(episode_rewards[:, agent_idx]))]
                 )
                 logger.add_scalar(f"{agents[agent_idx]}/episode_reward", mean_r, global_step)
 
             logger.add_scalar("noise/scale", noise_scale, global_step)
-            total_avg_reward = np.sum(episode_rewards) / num_envs
+            total_avg_reward = float(np.sum(episode_rewards) / max(1, real_num_envs))
             logger.add_scalar("train/total_reward", total_avg_reward, global_step)
 
+            # evaluate
             if global_step % eval_interval == 0:
                 maddpg.save(model_path)
                 create_gif = args.create_gif and (global_step % (eval_interval * 4) == 0)
+
                 avg_eval_rewards = evaluate(
                     env_evaluate,
                     maddpg,
@@ -322,7 +352,7 @@ def train(args):
                 if score > best_score:
                     best_score = score
                     maddpg.save(best_model_path)
-                    print(f"[Best] New Best: {best_score:.2f}")
+                    safe_print(f"[Best] New Best: {best_score:.2f}")
 
     maddpg.save(model_path)
     env.close()
@@ -332,10 +362,11 @@ def train(args):
     save_file_name = f"agent_rewards_seed{args.seed}.npy"
     save_path = os.path.join(logger.dir_name, save_file_name)
     np.save(save_path, agent_rewards)
-    print(f"[Save] Results saved to: {save_path}")
+    safe_print(f"[Save] Results saved to: {save_path}")
 
+    # also dump a copy to cwd
     np.save(save_file_name, agent_rewards)
-    print(f"[Save] Also saved copy to current folder: {save_file_name}")
+    safe_print(f"[Save] Also saved copy to current folder: {save_file_name}")
 
     return agent_rewards, experiment_name
 
