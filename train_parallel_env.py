@@ -1,6 +1,7 @@
 """
 Training script for MADDPG with PettingZoo using parallel environments (Auto-Detect + Fixes)
 """
+
 import torch
 import numpy as np
 import os
@@ -11,6 +12,7 @@ import time
 import platform
 import supersuit as ss
 import random
+
 from pettingzoo.mpe import simple_tag_v3, simple_spread_v3, simple_adversary_v3
 
 from maddpg import MADDPG, ReplayBuffer
@@ -21,14 +23,25 @@ from utils.utils import evaluate
 
 def create_parallel_env_auto(env_name, max_steps, num_envs):
     """
-    Auto-configures the environment based on OS.
-    Windows -> num_cpus=0 (Safe Mode)
-    Linux -> num_cpus=num_envs (Fast Mode)
+    Auto-configures PettingZoo parallel envs with SuperSuit vectorization.
+
+    Windows:
+      - Force serial execution (num_cpus=0) for stability.
+
+    Linux/Unix:
+      - Default: use multiprocessing (num_cpus=num_envs) for speed
+      - BUT for simple_spread_v3: force serial execution (num_cpus=0)
+        to avoid SuperSuit async constructor issues
+        (e.g., missing obs_space/act_space).
+
+    NOTE:
+      - num_envs stays the same (still concatenating N envs)
+      - only changes how concat_vec_envs_v1 parallelizes construction.
     """
     ENV_MODULES = {
-        'simple_tag_v3': simple_tag_v3,
-        'simple_spread_v3': simple_spread_v3,
-        'simple_adversary_v3': simple_adversary_v3
+        "simple_tag_v3": simple_tag_v3,
+        "simple_spread_v3": simple_spread_v3,
+        "simple_adversary_v3": simple_adversary_v3,
     }
 
     if env_name not in ENV_MODULES:
@@ -43,33 +56,60 @@ def create_parallel_env_auto(env_name, max_steps, num_envs):
         return env
 
     system_name = platform.system()
+
+    # Decide num_cpus
     if system_name == "Windows":
-        print("  Windows detected: Using Serial Execution (num_cpus=0) to prevent crashes.")
+        print("Windows detected: forcing serial execution (num_cpus=0) for stability.")
         n_cpus = 0
     else:
-        print(f" Linux/Unix detected: Using Parallel Execution (num_cpus={num_envs}) for max speed.")
-        n_cpus = num_envs
+        # Linux/Unix
+        if env_name == "simple_spread_v3":
+            print("Linux/Unix + simple_spread_v3: forcing serial execution (num_cpus=0) for stability.")
+            n_cpus = 0
+        else:
+            print(f"Linux/Unix detected: using parallel execution (num_cpus={num_envs}) for speed.")
+            n_cpus = num_envs
+
+    def _make_vec(base_class: str, num_cpus: int):
+        venv = ss.pettingzoo_env_to_vec_env_v1(env_fn())
+        venv = ss.concat_vec_envs_v1(
+            venv,
+            num_envs,
+            num_cpus=num_cpus,
+            base_class=base_class,
+        )
+        return venv
+
+    # Try desired mode first (prefer base_class='gym' for compatibility)
+    try:
+        return _make_vec(base_class="gym", num_cpus=n_cpus)
+    except Exception as e1:
+        print(f"[VecEnv] Failed: base_class='gym', num_cpus={n_cpus}. Error: {e1}")
 
     try:
-        vec_env = ss.pettingzoo_env_to_vec_env_v1(env_fn())
-        vec_env = ss.concat_vec_envs_v1(vec_env, num_envs, num_cpus=n_cpus, base_class='gymnasium')
-    except Exception as e:
-        print(f" Error creating envs: {e}. Falling back to single process.")
-        try:
-            vec_env = ss.pettingzoo_env_to_vec_env_v1(env_fn())
-            vec_env = ss.concat_vec_envs_v1(vec_env, num_envs, num_cpus=0, base_class='gymnasium')
-        except TypeError:
-            print(" 'gymnasium' failed, trying 'gym'...")
-            vec_env = ss.pettingzoo_env_to_vec_env_v1(env_fn())
-            vec_env = ss.concat_vec_envs_v1(vec_env, num_envs, num_cpus=0, base_class='gym')
+        return _make_vec(base_class="gymnasium", num_cpus=n_cpus)
+    except Exception as e2:
+        print(f"[VecEnv] Failed: base_class='gymnasium', num_cpus={n_cpus}. Error: {e2}")
 
-    return vec_env
+    # Fallback: serial execution
+    print("[VecEnv] Falling back to serial execution (num_cpus=0).")
+    try:
+        return _make_vec(base_class="gym", num_cpus=0)
+    except Exception as e3:
+        print(f"[VecEnv] Serial failed: base_class='gym'. Error: {e3}")
+
+    return _make_vec(base_class="gymnasium", num_cpus=0)
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env-name", type=str, default="simple_adversary_v3",
-                        choices=list(ENV_MAP.keys()), help="Name of the environment to use")
+    parser.add_argument(
+        "--env-name",
+        type=str,
+        default="simple_adversary_v3",
+        choices=list(ENV_MAP.keys()),
+        help="Name of the environment to use",
+    )
     parser.add_argument("--run-name", type=str, default=None, help="Run name")
     parser.add_argument("--num-envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--total-steps", type=int, default=int(1e6), help="Number of steps")
@@ -158,11 +198,11 @@ def train(args):
 
     model_path = os.path.join(logger.dir_name, "model.pt")
     best_model_path = os.path.join(logger.dir_name, "best_model.pt")
-    best_score = -float('inf')
+    best_score = -float("inf")
 
-    hidden_sizes = tuple(map(int, args.hidden_sizes.split(',')))
+    hidden_sizes = tuple(map(int, args.hidden_sizes.split(",")))
 
-    # ✅ IMPORTANT: pass ablation flags into MADDPG
+    # IMPORTANT: pass ablation flags into MADDPG
     maddpg = MADDPG(
         state_sizes=state_sizes,
         action_sizes=action_sizes,
@@ -184,21 +224,25 @@ def train(args):
         batch_size=args.batch_size,
         agents=agents,
         state_sizes=state_sizes,
-        action_sizes=action_sizes
+        action_sizes=action_sizes,
     )
 
-    print(" [Train]Starting Training on {platform.system()} | GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
-    print(f"   Mode: {dag_tag} | Envs: {num_envs} | Batch: {args.batch_size} | Seed: {args.seed}")
-    print(f"   DAG flags: no_gate={args.dag_no_gate}, no_decouple={args.dag_no_decouple}")
+    print(
+        f"[Train] Starting Training on {platform.system()} | GPU: "
+        f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}"
+    )
+    print(f"Mode: {dag_tag} | Envs: {num_envs} | Batch: {args.batch_size} | Seed: {args.seed}")
+    print(f"DAG flags: no_gate={args.dag_no_gate}, no_decouple={args.dag_no_decouple}")
 
     noise_scale = args.noise_scale
     decay_steps = min(args.noise_decay_steps // num_envs, args.total_steps // num_envs)
-    noise_decay = (args.noise_scale - args.min_noise) / decay_steps
+    noise_decay = (args.noise_scale - args.min_noise) / max(1, decay_steps)
 
     agent_rewards = [[] for _ in range(len(agents))]
     global_step = 0
     eval_interval = max(1, (args.eval_interval // num_envs) * num_envs)
 
+    # initial eval
     evaluate(env_evaluate, maddpg, logger, record_gif=False, num_eval_episodes=5, global_step=0)
 
     with tqdm(total=args.total_steps, desc=f"Training (Seed {args.seed})") as pbar:
@@ -226,7 +270,7 @@ def train(args):
                         actions=actions_stacked[env_idx],
                         rewards=rewards_reshaped[env_idx],
                         next_states=next_observations_reshaped[env_idx],
-                        dones=terminations_reshaped[env_idx]
+                        dones=terminations_reshaped[env_idx],
                     )
 
                 episode_rewards += rewards_reshaped
@@ -237,9 +281,9 @@ def train(args):
                         for i in range(num_agents):
                             experiences = buffer.sample()
                             critic_loss, actor_loss = maddpg.learn(experiences, i)
-                            if global_step % 100 == 0 and env_idx == 0:
-                                logger.add_scalar(f'{agents[i]}/critic_loss', critic_loss, global_step)
-                                logger.add_scalar(f'{agents[i]}/actor_loss', actor_loss, global_step)
+                            if global_step % 100 == 0:
+                                logger.add_scalar(f"{agents[i]}/critic_loss", critic_loss, global_step)
+                                logger.add_scalar(f"{agents[i]}/actor_loss", actor_loss, global_step)
                         maddpg.update_targets()
 
                 if args.use_noise_decay:
@@ -247,6 +291,7 @@ def train(args):
 
                 global_step += num_envs
                 pbar.update(num_envs)
+
                 if any(dones):
                     break
 
@@ -255,25 +300,29 @@ def train(args):
                 agent_rewards[agent_idx].append(
                     [mean_r, np.min(episode_rewards[:, agent_idx]), np.max(episode_rewards[:, agent_idx])]
                 )
-                logger.add_scalar(f'{agents[agent_idx]}/episode_reward', mean_r, global_step)
+                logger.add_scalar(f"{agents[agent_idx]}/episode_reward", mean_r, global_step)
 
-            logger.add_scalar('noise/scale', noise_scale, global_step)
+            logger.add_scalar("noise/scale", noise_scale, global_step)
             total_avg_reward = np.sum(episode_rewards) / num_envs
-            logger.add_scalar('train/total_reward', total_avg_reward, global_step)
+            logger.add_scalar("train/total_reward", total_avg_reward, global_step)
 
             if global_step % eval_interval == 0:
                 maddpg.save(model_path)
                 create_gif = args.create_gif and (global_step % (eval_interval * 4) == 0)
                 avg_eval_rewards = evaluate(
-                    env_evaluate, maddpg, logger,
-                    num_eval_episodes=5, record_gif=create_gif, global_step=global_step
+                    env_evaluate,
+                    maddpg,
+                    logger,
+                    num_eval_episodes=5,
+                    record_gif=create_gif,
+                    global_step=global_step,
                 )
 
-                score = np.sum(avg_eval_rewards)
+                score = float(np.sum(avg_eval_rewards))
                 if score > best_score:
                     best_score = score
                     maddpg.save(best_model_path)
-                    print(f"[Best]New Best: {best_score:.2f}")
+                    print(f"[Best] New Best: {best_score:.2f}")
 
     maddpg.save(model_path)
     env.close()
