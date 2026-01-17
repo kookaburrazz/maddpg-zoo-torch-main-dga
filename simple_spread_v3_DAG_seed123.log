@@ -1,0 +1,51 @@
+/data/AndrewYu1/workspace/code/Ray/maddpg-zoo-torch-main-dga/train_parallel_env.py:14: DeprecationWarning: The environment `pettingzoo.mpe` has been moved to `mpe2` and will be removed in a future release.Please update your imports.
+  from pettingzoo.mpe import simple_tag_v3, simple_spread_v3, simple_adversary_v3
+/data/timran/envs/ms-swift/lib/python3.10/site-packages/pygame/pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+[Seed] Random Seed set to: 123
+----------------------------------------------------------------------------
+| Hyperparams                    | Values                                  |
+----------------------------------------------------------------------------
+| env_name                       | simple_spread_v3                        |
+| run_name                       | None                                    |
+| num_envs                       | 32                                      |
+| total_steps                    | 500000                                  |
+| buffer_size                    | 1000000                                 |
+| batch_size                     | 8192                                    |
+| max_steps                      | 60                                      |
+| gamma                          | 0.95                                    |
+| tau                            | 0.01                                    |
+| actor_lr                       | 0.001                                   |
+| critic_lr                      | 0.001                                   |
+| hidden_sizes                   | 256,256                                 |
+| update_every                   | 1                                       |
+| num_updates                    | 4                                       |
+| noise_scale                    | 0.3                                     |
+| min_noise                      | 0.05                                    |
+| noise_decay_steps              | 500000                                  |
+| use_noise_decay                | True                                    |
+| eval_interval                  | 5000                                    |
+| render_mode                    | None                                    |
+| create_gif                     | False                                   |
+| use_dag                        | True                                    |
+| dag_no_gate                    | False                                   |
+| dag_no_decouple                | False                                   |
+| seed                           | 123                                     |
+----------------------------------------------------------------------------
+Creating test environment 'simple_spread_v3' to get agent information...
+error: XDG_RUNTIME_DIR not set in the environment.
+Original action sizes: [5, 5, 5]
+Original observation sizes: [18, 18, 18]
+Action bounds for each agent:
+  ['agent_0', 'agent_1', 'agent_2']: [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]
+All agents have the same action bounds.
+Using action bounds from agent_0: [0.0, 1.0]
+Padded action sizes: [5, 5, 5]
+Padded observation sizes: [18, 18, 18]
+Environment: simple_spread_v3
+Number of agents: 3
+Agent names: ['agent_0', 'agent_1', 'agent_2']
+Agent Groups: [[0, 1, 2]]
+ Linux/Unix detected: Using Parallel Execution (num_cpus=32) for max speed.
+error: XDG_RUNTIME_DIR not set in the environment.
+ Error creating envs: MakeCPUAsyncConstructor.<locals>.constructor() missing 2 required positional arguments: 'obs_space' and 'act_space'. Falling back to single process.

@@ -1,0 +1,4 @@
+/data/AndrewYu1/workspace/code/Ray/maddpg-zoo-torch-main-dga/train_parallel_env.py:14: DeprecationWarning: The environment `pettingzoo.mpe` has been moved to `mpe2` and will be removed in a future release.Please update your imports.
+  from pettingzoo.mpe import simple_tag_v3, simple_spread_v3, simple_adversary_v3
+/data/timran/envs/ms-swift/lib/python3.10/site-packages/pygame/pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists

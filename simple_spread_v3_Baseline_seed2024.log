@@ -1,0 +1,38 @@
+/data/AndrewYu1/workspace/code/Ray/maddpg-zoo-torch-main-dga/train_parallel_env.py:14: DeprecationWarning: The environment `pettingzoo.mpe` has been moved to `mpe2` and will be removed in a future release.Please update your imports.
+  from pettingzoo.mpe import simple_tag_v3, simple_spread_v3, simple_adversary_v3
+/data/timran/envs/ms-swift/lib/python3.10/site-packages/pygame/pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+Traceback (most recent call last):
+  File "/data/AndrewYu1/workspace/code/Ray/maddpg-zoo-torch-main-dga/train_parallel_env.py", line 18, in <module>
+    from utils.logger import Logger
+  File "/data/AndrewYu1/workspace/code/Ray/maddpg-zoo-torch-main-dga/utils/logger.py", line 11, in <module>
+    from torch.utils.tensorboard import SummaryWriter
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/torch/utils/tensorboard/__init__.py", line 12, in <module>
+    from .writer import FileWriter, SummaryWriter
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/torch/utils/tensorboard/writer.py", line 16, in <module>
+    from tensorboard.summary.writer.event_file_writer import EventFileWriter
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/tensorboard/summary/__init__.py", line 22, in <module>
+    from tensorboard.summary import v1  # noqa: F401
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/tensorboard/summary/v1.py", line 23, in <module>
+    from tensorboard.plugins.histogram import summary as _histogram_summary
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/tensorboard/plugins/histogram/summary.py", line 35, in <module>
+    from tensorboard.plugins.histogram import summary_v2
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/tensorboard/plugins/histogram/summary_v2.py", line 35, in <module>
+    from tensorboard.util import tensor_util
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/tensorboard/util/tensor_util.py", line 20, in <module>
+    from tensorboard.compat.tensorflow_stub import dtypes, compat, tensor_shape
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/tensorboard/compat/tensorflow_stub/__init__.py", line 22, in <module>
+    from .dtypes import as_dtype  # noqa
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/tensorboard/compat/tensorflow_stub/dtypes.py", line 19, in <module>
+    from . import pywrap_tensorflow
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/tensorboard/compat/tensorflow_stub/pywrap_tensorflow.py", line 22, in <module>
+    from .io import gfile
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/tensorboard/compat/tensorflow_stub/io/__init__.py", line 17, in <module>
+    from . import gfile  # noqa
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+  File "<frozen importlib._bootstrap_external>", line 879, in exec_module
+  File "<frozen importlib._bootstrap_external>", line 1012, in get_code
+  File "<frozen importlib._bootstrap_external>", line 672, in _compile_bytecode
+KeyboardInterrupt
