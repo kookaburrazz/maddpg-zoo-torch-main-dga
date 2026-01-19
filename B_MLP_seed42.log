@@ -1,0 +1,50 @@
+nohup: ignoring input
+Training using device: cuda
+Creating test environment 'simple_adversary_v3' to get agent information...
+error: XDG_RUNTIME_DIR not set in the environment.
+Original action sizes: [5, 5, 5]
+Original observation sizes: [8, 10, 10]
+Action bounds for each agent:
+  ['adversary_0', 'agent_0', 'agent_1']: [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]
+All agents have the same action bounds.
+Using action bounds from adversary_0: [0.0, 1.0]
+Applying observation padding for simple_adversary_v3
+Padded action sizes: [5, 5, 5]
+Padded observation sizes: [10, 10, 10]
+Environment: simple_adversary_v3
+Number of agents: 3
+Agent names: ['adversary_0', 'agent_0', 'agent_1']
+Creating single 'simple_adversary_v3' environment...
+error: XDG_RUNTIME_DIR not set in the environment.
+Agent Groups: [0, 0, 0]
+📁 Training data will be saved to: ./runs/simple_adversary_v3/B_MLP_seed42
+Start Training: simple_adversary_v3 | Mode: MLP | Agents: 3
+Traceback (most recent call last):
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/supersuit/lambda_wrappers/action_lambda.py", line 42, in _modify_action
+    return self.change_action_fn(action, old_act_space, agent)
+TypeError: pad_action_space_v0.<locals>.<lambda>() takes 2 positional arguments but 3 were given
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data/AndrewYu1/workspace/code/Ray/maddpg-zoo-torch-main-dga/train.py", line 179, in <module>
+    train(args)
+  File "/data/AndrewYu1/workspace/code/Ray/maddpg-zoo-torch-main-dga/train.py", line 143, in train
+    next_obs, rewards, terms, truncs, _ = env.step(actions_dict)
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/pettingzoo/utils/conversions.py", line 221, in step
+    self.aec_env.step(None)
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/supersuit/utils/base_aec_wrapper.py", line 46, in step
+    super().step(action)
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/pettingzoo/utils/wrappers/order_enforcing.py", line 70, in step
+    super().step(action)
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/pettingzoo/utils/wrappers/base.py", line 47, in step
+    self.env.step(action)
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/supersuit/utils/base_aec_wrapper.py", line 44, in step
+    action = self._modify_action(agent, action)
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/supersuit/lambda_wrappers/action_lambda.py", line 44, in _modify_action
+    return self.change_action_fn(action, old_act_space)
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/supersuit/multiagent_wrappers/padding_wrappers.py", line 19, in <lambda>
+    lambda action, act_space: homogenize_ops.dehomogenize_actions(
+  File "/data/timran/envs/ms-swift/lib/python3.10/site-packages/supersuit/utils/action_transforms/homogenize_ops.py", line 74, in dehomogenize_actions
+    cur_shape = action.shape
+AttributeError: 'NoneType' object has no attribute 'shape'
